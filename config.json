@@ -1,0 +1,5 @@
+{
+    "BasePath": "C:/path/to/your/videos",
+    "OutputPath": "C:/path/to/your/output",
+    "FfmpegPath": "C:/path/to/ffmpeg/bin/ffmpeg.exe"
+  }

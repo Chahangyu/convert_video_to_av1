@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 )
 
@@ -135,20 +136,35 @@ func findVideoFiles(basePath string) ([]string, error) {
 	return allVideoFiles, nil
 }
 
-// 비디오 파일의 코덱 정보를 가져오는 함수
+// 비디오 파일의 코덱 정보를 가져오는 함수 (ffprobe 사용)
 func getVideoCodec(filePath string, ffmpegPath string) (string, error) {
-	// FFmpeg 명령어를 사용하여 비디오 코덱 정보 추출
-	cmd := exec.Command(ffmpegPath,
-		"-i", filePath,
-		"-hide_banner",
+	// ffprobe 경로 얻기 (ffmpeg 경로를 기반으로)
+	ffmpegDir := filepath.Dir(ffmpegPath)
+	ffprobePath := filepath.Join(ffmpegDir, "ffprobe")
+	
+	// Windows 환경의 경우 .exe 확장자 추가
+	if runtime.GOOS == "windows" {
+		ffprobePath += ".exe"
+	}
+	
+	// ffprobe 실행 파일 존재 여부 확인
+	if _, err := os.Stat(ffprobePath); os.IsNotExist(err) {
+		log.Printf("경고: ffprobe를 찾을 수 없습니다: %s, 시스템 PATH에서 찾기 시도", ffprobePath)
+		ffprobePath = "ffprobe"
+	}
+	
+	// ffprobe 명령어 실행하여 코덱 정보 추출
+	cmd := exec.Command(ffprobePath,
+		"-v", "error",
 		"-select_streams", "v:0",
 		"-show_entries", "stream=codec_name",
 		"-of", "default=noprint_wrappers=1:nokey=1",
+		filePath,
 	)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("코덱 정보 추출 중 오류 발생: %w", err)
+		return "", fmt.Errorf("코덱 정보 추출 중 오류 발생: %w, 명령어: %s", err, cmd.String())
 	}
 
 	// 결과에서 공백 제거

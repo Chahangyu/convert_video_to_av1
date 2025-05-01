@@ -1,0 +1,281 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io/fs"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strings"
+)
+
+type Config struct {
+	BasePath   string `json:"BasePath"`
+	FfmpegPath string `json:"FfmpegPath"`
+}
+
+var videoExtensions = map[string]bool{
+	".mp4":  true,
+	".avi":  true,
+	".mkv":  true,
+	".mov":  true,
+	".wmv":  true,
+	".flv":  true,
+	".webm": true,
+}
+
+func loadConfig(filename string) (Config, error) {
+	var config Config
+	configFile, err := os.ReadFile(filename)
+	if err != nil {
+		return config, fmt.Errorf("설정 파일 '%s'을(를) 읽는 중 오류 발생: %w", filename, err)
+	}
+	err = json.Unmarshal(configFile, &config)
+	if err != nil {
+		return config, fmt.Errorf("설정 파일 '%s'의 JSON 파싱 중 오류 발생: %w", filename, err)
+	}
+
+	if config.BasePath == "" {
+		return config, fmt.Errorf("설정 파일에 'BasePath'가 지정되지 않았습니다")
+	}
+
+	if config.FfmpegPath == "" {
+		log.Println("'FfmpegPath'가 설정 파일에 지정되지 않았습니다. 기본값 'ffmpeg'를 사용합니다 (PATH 환경 변수에서 검색).")
+		config.FfmpegPath = "ffmpeg"
+	}
+
+	if _, err := os.Stat(config.BasePath); os.IsNotExist(err) {
+		return config, fmt.Errorf("설정에 지정된 BasePath '%s'이(가) 존재하지 않습니다", config.BasePath)
+	}
+
+	if _, err := exec.LookPath(config.FfmpegPath); err != nil {
+		if _, statErr := os.Stat(config.FfmpegPath); os.IsNotExist(statErr) {
+			return config, fmt.Errorf("설정에 지정된 FfmpegPath '%s'를 찾을 수 없습니다. PATH 환경 변수를 확인하거나 올바른 전체 경로를 지정해주세요: %w", config.FfmpegPath, err)
+		} else if statErr != nil {
+			return config, fmt.Errorf("FfmpegPath '%s' 확인 중 오류 발생: %w", config.FfmpegPath, statErr)
+		}
+		log.Printf("경고: FfmpegPath '%s' 파일은 존재하지만 실행 가능한 상태인지 확인하지 못했습니다. PATH 또는 권한 문제를 확인하세요.", config.FfmpegPath)
+	}
+
+	return config, nil
+}
+
+// 디렉토리 이름이 yyyymmdd 형식인지 확인하는 함수
+func isDateFormatDir(dirName string) bool {
+	datePattern := regexp.MustCompile(`^\d{8}$`) // yyyymmdd 형식 확인
+	return datePattern.MatchString(dirName)
+}
+
+// 특정 디렉토리 내의 비디오 파일 찾기
+func findVideosInDir(dirPath string) ([]string, error) {
+	var videoFiles []string
+
+	err := filepath.WalkDir(dirPath, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			log.Printf("경로 접근 중 오류 발생 '%s': %v", path, err)
+			return nil
+		}
+		if !d.IsDir() {
+			ext := strings.ToLower(filepath.Ext(path))
+			if _, ok := videoExtensions[ext]; ok {
+				log.Printf("비디오 파일 발견: %s", path)
+				videoFiles = append(videoFiles, path)
+			}
+		}
+		return nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("디렉토리 '%s' 탐색 중 오류 발생: %w", dirPath, err)
+	}
+
+	return videoFiles, nil
+}
+
+func findVideoFiles(basePath string) ([]string, error) {
+	var allVideoFiles []string
+	log.Printf("yyyymmdd 형식의 디렉토리 검색 시작: %s", basePath)
+
+	// basePath 내의 항목들을 읽음
+	entries, err := os.ReadDir(basePath)
+	if err != nil {
+		return nil, fmt.Errorf("기본 경로 '%s' 읽기 중 오류 발생: %w", basePath, err)
+	}
+
+	// yyyymmdd 형식의 디렉토리 찾기
+	var dateFormatDirs []string
+	for _, entry := range entries {
+		if entry.IsDir() && isDateFormatDir(entry.Name()) {
+			dateFormatDir := filepath.Join(basePath, entry.Name())
+			log.Printf("날짜 형식 디렉토리 발견: %s", dateFormatDir)
+			dateFormatDirs = append(dateFormatDirs, dateFormatDir)
+		}
+	}
+
+	if len(dateFormatDirs) == 0 {
+		log.Printf("yyyymmdd 형식의 디렉토리를 찾지 못했습니다.")
+		return nil, nil
+	}
+
+	// 각 날짜 형식 디렉토리 내에서 비디오 파일 검색
+	for _, dateDir := range dateFormatDirs {
+		log.Printf("디렉토리 내 비디오 파일 검색 중: %s", dateDir)
+		videoFiles, err := findVideosInDir(dateDir)
+		if err != nil {
+			log.Printf("경고: 디렉토리 '%s' 검색 중 오류 발생: %v", dateDir, err)
+			continue
+		}
+		allVideoFiles = append(allVideoFiles, videoFiles...)
+	}
+
+	log.Printf("총 %d개의 날짜 형식 디렉토리와 %d개의 비디오 파일을 찾았습니다.", len(dateFormatDirs), len(allVideoFiles))
+	return allVideoFiles, nil
+}
+
+// ffprobe 경로 얻기 (ffmpeg 경로를 기반으로)하는 함수
+func getFfprobePath(ffmpegPath string) string {
+	ffmpegDir := filepath.Dir(ffmpegPath)
+	ffprobePath := filepath.Join(ffmpegDir, "ffprobe")
+
+	// Windows 환경의 경우 .exe 확장자 추가
+	if runtime.GOOS == "windows" {
+		ffprobePath += ".exe"
+	}
+
+	// ffprobe 실행 파일 존재 여부 확인
+	if _, err := os.Stat(ffprobePath); os.IsNotExist(err) {
+		log.Printf("경고: ffprobe를 찾을 수 없습니다: %s, 시스템 PATH에서 찾기 시도", ffprobePath)
+		ffprobePath = "ffprobe"
+	}
+	return ffprobePath
+}
+
+// 비디오 파일의 오디오 코덱 정보를 가져오는 함수
+func getAudioCodec(filePath string, ffmpegPath string) (string, error) {
+	ffprobePath := getFfprobePath(ffmpegPath)
+
+	// ffprobe 명령어 실행하여 오디오 코덱 정보 추출
+	cmd := exec.Command(ffprobePath,
+		"-v", "error",
+		"-select_streams", "a:0",
+		"-show_entries", "stream=codec_name",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		filePath,
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("오디오 코덱 정보 추출 중 오류 발생: %w, 명령어: %s", err, cmd.String())
+	}
+
+	// 결과에서 공백 제거
+	codec := strings.TrimSpace(string(output))
+	log.Printf("파일 '%s'의 오디오 코덱: %s", filePath, codec)
+
+	return codec, nil
+}
+
+// AAC 오디오 추출 함수
+func extractAACaudio(inputPath string, ffmpegPath string) error {
+	// 오디오 코덱 확인
+	audioCodec, err := getAudioCodec(inputPath, ffmpegPath)
+	if err != nil {
+		return fmt.Errorf("오디오 코덱 확인 실패: %w", err)
+	}
+
+	// AAC 코덱이 아닌 경우 스킵
+	if !strings.Contains(strings.ToLower(audioCodec), "aac") {
+		log.Printf("스킵: 파일 '%s'의 오디오는 AAC 코덱이 아닙니다. (현재 코덱: %s)", inputPath, audioCodec)
+		return nil
+	}
+
+	// 출력 파일명 생성
+	dir := filepath.Dir(inputPath)
+	baseName := filepath.Base(inputPath)
+	ext := filepath.Ext(baseName)
+	outputFileName := fmt.Sprintf("%s_audio.m4a", strings.TrimSuffix(baseName, ext))
+	fullOutputPath := filepath.Join(dir, outputFileName)
+
+	// 이미 파일이 존재하는지 확인
+	if _, err := os.Stat(fullOutputPath); err == nil {
+		log.Printf("스킵: 오디오 파일 '%s'이(가) 이미 존재합니다.", fullOutputPath)
+		return nil
+	}
+
+	log.Printf("AAC 오디오 추출 시작: '%s' -> '%s'", inputPath, fullOutputPath)
+
+	// FFmpeg 명령어로 오디오 추출
+	cmd := exec.Command(ffmpegPath,
+		"-i", inputPath,
+		"-vn",             // 비디오 스트림 제외
+		"-acodec", "copy", // 오디오 코덱 복사 (변환 없음)
+		"-y", // 파일 덮어쓰기
+		fullOutputPath,
+	)
+
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	log.Printf("실행할 FFmpeg 명령어: %s", cmd.String())
+
+	err = cmd.Run()
+	if err != nil {
+		errMsg := fmt.Sprintf("오디오 추출 중 오류 발생 (파일: %s): %v", inputPath, err)
+		if exitError, ok := err.(*exec.ExitError); ok {
+			errMsg = fmt.Sprintf("%s, 종료 코드: %d, 에러 출력: %s", errMsg, exitError.ExitCode(), string(exitError.Stderr))
+		}
+		log.Println(errMsg)
+		return fmt.Errorf(errMsg)
+	}
+
+	log.Printf("AAC 오디오 추출 완료: '%s'", fullOutputPath)
+	return nil
+}
+
+func main() {
+	log.Println("AAC 오디오 추출 프로그램 시작")
+
+	config, err := loadConfig("config.json")
+	if err != nil {
+		log.Fatalf("설정 로드 실패: %v", err)
+	}
+	log.Printf("설정 로드 완료: BasePath='%s', FfmpegPath='%s'", config.BasePath, config.FfmpegPath)
+
+	videoFiles, err := findVideoFiles(config.BasePath)
+	if err != nil {
+		log.Fatalf("비디오 파일 검색 실패: %v", err)
+	}
+
+	if len(videoFiles) == 0 {
+		log.Println("yyyymmdd 형식의 디렉토리 내에서 처리할 비디오 파일을 찾지 못했습니다.")
+		log.Println("프로그램 종료")
+		return
+	}
+
+	extractedCount := 0
+	errorCount := 0
+	skippedCount := 0
+	notAACCount := 0
+
+	for _, file := range videoFiles {
+		err := extractAACaudio(file, config.FfmpegPath)
+		if err != nil {
+			log.Printf("파일 처리 실패: %s - 오류: %v", file, err)
+			errorCount++
+		} else if strings.Contains(strings.ToLower(file), "aac 코덱이 아닙니다") {
+			notAACCount++
+		} else if strings.Contains(strings.ToLower(file), "이미 존재합니다") {
+			skippedCount++
+		} else {
+			extractedCount++
+		}
+	}
+
+	log.Printf("모든 작업 완료. 성공적으로 추출: %d, 실패: %d, 스킵(이미 존재): %d, AAC 아님: %d",
+		extractedCount, errorCount, skippedCount, notAACCount)
+	log.Println("프로그램 종료")
+}
